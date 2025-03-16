@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jan 21 20:35:22 2025
+
+@author: david
+"""
+import os  # Importa el módulo para manejar variables de entorno y funciones del sistema operativo.
+import json  # Importa el módulo para trabajar con datos en formato JSON.
+import time  # Importa el módulo para manejar pausas y control del tiempo.
+import requests  # Importa el módulo para hacer solicitudes HTTP a APIs externas.
+import streamlit as st  # Importa Streamlit para crear una interfaz de usuario interactiva en la web.
+from dotenv import load_dotenv  # Importa la función para cargar variables de entorno desde un archivo .env.
+import openai  # Importa la librería OpenAI para interactuar con su API.
+
+# Cargar las variables de entorno
+load_dotenv()  # Carga las variables de entorno desde un archivo .env.
+
+# Configurar API keys
+openai.api_key = os.environ.get("OPENAI_API_KEY")  # Obtiene la API key de OpenAI desde las variables de entorno.
+news_api_key = os.environ.get("NEWS_API_KEY")  # Obtiene la API key de NewsAPI desde las variables de entorno.
+
+# Configuración del cliente OpenAI
+client = openai.OpenAI()  # Inicializa el cliente de OpenAI.
+
+# Función para obtener noticias desde NewsAPI
+def get_news(topic):  # Define una función para obtener noticias sobre un tema específico.
+    url = (
+        f"https://newsapi.org/v2/everything?q={topic}&apiKey={news_api_key}&pageSize=5"
+    )  # Construye la URL para la solicitud a NewsAPI con el tema y la clave de API.
+
+    try:
+        response = requests.get(url)  # Realiza la solicitud HTTP GET a la API.
+
+        if response.status_code == 200:  # Verifica si la respuesta fue exitosa.
+            news_json = response.json()  # Convierte la respuesta en formato JSON.
+            articles = news_json.get("articles", [])  # Obtiene la lista de artículos.
+
+            final_news = []  # Lista para almacenar las noticias formateadas.
+
+            for article in articles:  # Itera sobre cada artículo recibido.
+                source_name = article.get("source", {}).get("name", "Unknown Source")  # Obtiene el nombre de la fuente.
+                author = article.get("author", "Unknown Author")  # Obtiene el autor.
+                title = article.get("title", "No Title")  # Obtiene el título.
+                description = article.get("description", "No Description")  # Obtiene la descripción.
+                url = article.get("url", "#")  # Obtiene la URL del artículo.
+
+                news_entry = f"""
+                **Title:** {title}  
+                **Author:** {author}  
+                **Source:** {source_name}  
+                **Description:** {description}  
+                **URL:** [Link]({url})  
+                """  # Formatea la información en un bloque de texto.
+                
+                final_news.append(news_entry)  # Agrega la noticia formateada a la lista.
+
+            return final_news  # Devuelve la lista de noticias formateadas.
+        else:
+            return ["Error: Unable to fetch news."]  # Devuelve un mensaje de error si la solicitud falla.
+    except requests.exceptions.RequestException as e:
+        return [f"Error: {e}"]  # Captura errores de red y devuelve el mensaje de error.
+
+# Función para manejar las llamadas a herramientas del asistente
+def handle_tool_calls(client, thread_id, run):
+    if run.status == "requires_action":  # Verifica si la ejecución requiere acción adicional.
+        tool_outputs = []  # Lista para almacenar las respuestas de las herramientas.
+
+        for tool_call in run.required_action.submit_tool_outputs.tool_calls:  # Itera sobre las llamadas a herramientas.
+            tool_call_id = tool_call.id  # Obtiene el ID de la herramienta.
+            name = tool_call.function.name  # Obtiene el nombre de la función.
+            arguments = json.loads(tool_call.function.arguments)  # Convierte los argumentos de JSON a diccionario.
+
+            if name == "get_news":  # Verifica si la herramienta solicitada es la de noticias.
+                topic = arguments.get("topic")  # Obtiene el tema de los argumentos.
+                output = get_news(topic)  # Llama a la función para obtener noticias.
+                tool_outputs.append({"tool_call_id": tool_call_id, "output": json.dumps(output)})  # Guarda la salida.
+
+        run = client.beta.threads.runs.submit_tool_outputs(
+            thread_id=thread_id, run_id=run.id, tool_outputs=tool_outputs
+        )  # Envía los resultados de las herramientas al asistente.
+
+        return handle_tool_calls(client, thread_id, run)  # Llama recursivamente si hay más acciones pendientes.
+
+    return run  # Devuelve la ejecución actualizada.
+
+# Función para esperar que una ejecución se complete
+def wait_for_run_completion(client, thread_id, run, sleep_interval=5):
+    while True:  # Bucle infinito hasta que la ejecución se complete o falle.
+        run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)  # Recupera el estado de la ejecución.
+
+        if run.status in ["completed", "failed"]:  # Verifica si la ejecución ha finalizado.
+            if run.status == "completed":  # Si la ejecución fue exitosa:
+                messages = client.beta.threads.messages.list(thread_id=thread_id)  # Obtiene los mensajes del hilo.
+                last_message = messages.data[0]  # Obtiene el último mensaje.
+                response = last_message.content[0].text.value  # Extrae el contenido del mensaje.
+                return response  # Devuelve la respuesta del asistente.
+            else:
+                return "Run failed."  # Devuelve un mensaje de error si falló.
+        elif run.status == "requires_action":  # Si requiere acción adicional:
+            run = handle_tool_calls(client, thread_id, run)  # Maneja las llamadas a herramientas.
+        else:
+            time.sleep(sleep_interval)  # Espera antes de revisar nuevamente.
+
+# Inicializar estado de la sesión
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = None  # Guarda el ID del hilo en la sesión si no existe.
+if "messages" not in st.session_state:
+    st.session_state.messages = []  # Inicializa una lista para almacenar los mensajes en la sesión.
+
+# Interfaz de usuario en Streamlit
+st.title("🗞️ News Summarizer Assistant 🗞️")  # Agrega un título a la aplicación.
+
+# Formulario para el tema de las noticias
+with st.form(key="news_form"):  # Crea un formulario en Streamlit.
+    topic = st.text_input("Enter topic:", "")  # Campo de entrada de texto para el usuario.
+    submit_button = st.form_submit_button(label="Run Assistant")  # Botón de envío del formulario.
+
+# Lógica al presionar el botón
+if submit_button:  # Si el usuario presiona el botón:
+    if topic:  # Verifica que se haya ingresado un tema.
+        # Si no hay thread_id, crear un nuevo thread
+        if st.session_state.thread_id is None:
+            thread = client.beta.threads.create(
+                messages=[
+                    {"role": "user", "content": f"{topic}."},  # Crea un nuevo hilo con el tema ingresado.
+                ]
+            )
+            st.session_state.thread_id = thread.id  # Guarda el ID del hilo en la sesión.
+
+        # Añadimos nuevo mensaje al thread para que pueda ser usado en el nuevo run
+        else:
+            client.beta.threads.messages.create(
+                thread_id=st.session_state.thread_id,
+                role="user",
+                content=f"{topic}."  # Agrega un nuevo mensaje al hilo existente.
+            )
+
+        # Crear una ejecución con el asistente
+        run = client.beta.threads.runs.create(
+            thread_id=st.session_state.thread_id,
+            assistant_id="asst_0ISunU2jfQPiGk7heT3RiK8Q",
+        )  # Inicia la ejecución con el asistente.
+
+        # Esperar que la ejecución termine
+        result = wait_for_run_completion(client, st.session_state.thread_id, run)  # Espera la respuesta.
+
+        # Guardar el mensaje del usuario y la respuesta del asistente en la memoria
+        st.session_state.messages.append({"user": topic, "assistant": result})  # Guarda la conversación.
+
+        # Mostrar los resultados
+        if result:
+            st.write("### 🤖 Assistant's Response:")  # Muestra la respuesta del asistente.
+            st.markdown(result)
+    else:
+        st.error("Please enter a topic.")  # Muestra un error si el usuario no ingresa un tema.
+
+# Mostrar historial de conversación
+if st.session_state.messages:  # Si hay mensajes guardados:
+    st.write("### 📜 Conversation History")  # Muestra el historial.
+    for msg in st.session_state.messages:
+        st.markdown(f"**You:** {msg['user']}")  # Muestra el mensaje del usuario.
+        st.markdown(f"**Assistant:** {msg['assistant']}")  # Muestra la respuesta del asistente.
+
